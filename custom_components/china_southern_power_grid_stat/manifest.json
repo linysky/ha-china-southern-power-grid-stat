@@ -1,0 +1,21 @@
+{
+  "domain": "china_southern_power_grid_stat",
+  "name": "China Southern Power Grid Statistics",
+  "codeowners": [
+    "@linysky"
+  ],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/linysky/ha-china-southern-power-grid-stat",
+  "homekit": {},
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/linysky/ha-china-southern-power-grid-stat/issues",
+  "requirements": [
+    "pycryptodome",
+    "brotli"
+  ],
+  "ssdp": [],
+  "version": "1.4.0.post1",
+  "zeroconf": [],
+  "integration_type": "service"
+}
