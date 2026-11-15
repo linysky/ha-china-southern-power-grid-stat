@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 
 from homeassistant.components import persistent_notification
 from homeassistant.config_entries import ConfigEntry
@@ -30,6 +31,24 @@ from .csg_client import (
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 _LOGGER = logging.getLogger(__name__)
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Serve the bundled query page and Lovelace card.
+
+    Keeping the assets inside the integration means HACS installs them
+    together with the code; no manual copy into /config/www is needed.
+    """
+    try:
+        from homeassistant.components.http import StaticPathConfig
+
+        assets = Path(__file__).parent / "www"
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig("/csg_stat", str(assets), False)]
+        )
+        _LOGGER.debug("CSG static assets registered at /csg_stat")
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.warning("CSG static assets unavailable: %s", err)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

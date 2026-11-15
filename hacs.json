@@ -1,4 +1,7 @@
 {
   "name": "南方电网电费统计",
-  "render_readme": true
+  "content_in_root": false,
+  "render_readme": true,
+  "homeassistant": "2024.6.0",
+  "hacs": "2.0.0"
 }

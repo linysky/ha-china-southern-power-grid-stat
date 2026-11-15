@@ -1,0 +1,25 @@
+query_daily_cost:
+  name: 查询每日电费
+  description: >-
+    查询指定日期区间内每一天的电量与电费。南网已下线每日电费接口，
+    每日电费由真实每日电量结合阶梯电价推算，并按官方月账单总额校准；
+    账单金额本身为南网返回的真实值。
+  fields:
+    start:
+      name: 开始日期
+      description: YYYY-MM-DD，默认从最早有账单的月份起
+      example: "2024-01-01"
+      selector:
+        text:
+    end:
+      name: 结束日期
+      description: YYYY-MM-DD，默认今天
+      example: "2026-01-31"
+      selector:
+        text:
+    account:
+      name: 缴费号
+      description: 多个缴费号时必填；只有一个缴费号时可省略
+      example: "1234567890123456"
+      selector:
+        text:

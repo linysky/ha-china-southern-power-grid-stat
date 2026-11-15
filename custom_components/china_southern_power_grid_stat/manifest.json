@@ -15,7 +15,7 @@
     "brotli"
   ],
   "ssdp": [],
-  "version": "1.4.0.post1",
+  "version": "1.6.0",
   "zeroconf": [],
   "integration_type": "service"
 }
