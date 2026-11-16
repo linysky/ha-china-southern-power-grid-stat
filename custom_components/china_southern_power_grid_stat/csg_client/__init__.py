@@ -38,6 +38,8 @@ from .const import (
     ATTR_USER_NAME,
     BASE_PATH_QR_NEW,
     BASE_PATH_WEB,
+    DAILY_ENDPOINT_BUDGET_SECONDS,
+    DAILY_ENDPOINT_RETRY_SECONDS,
     CREDENTIAL_PUBKEY,
     HEADER_CUST_NUMBER,
     HEADER_X_AUTH_TOKEN,
@@ -70,6 +72,7 @@ from .const import (
     RESP_STA_QR_NOT_SCANNED,
     RESP_STA_QR_TIMEOUT,
     RESP_STA_SUCCESS,
+    RESP_STA_SYSTEM_ERROR,
     SEND_MSG_TYPE_VERIFICATION_CODE,
     VERIFICATION_CODE_TYPE_LOGIN,
     WF_ATTR_CHARGE,
@@ -375,16 +378,25 @@ class CSGClient:
 
             json_str = response.content.decode("utf-8", errors="ignore")
             json_str = json_str[json_str.find("{") : json_str.rfind("}") + 1]
-            json_data = json.loads(json_str)
-            response_data = json_data
+            try:
+                response_data = json.loads(json_str)
+            except json.JSONDecodeError as err:
+                _LOGGER.warning("CSG API %s returned a non-JSON body", path)
+                raise CSGAPIError("PARSE", f"{path}: non-JSON response") from err
+            if not isinstance(response_data, dict):
+                raise CSGAPIError("PARSE", f"{path}: response is not an object")
             if (
                 response.headers.get("need-decrypto")
                 and isinstance(response_data.get(JSON_KEY_DATA), str)
             ):
                 key, iv = self._crypto_material()
-                response_data[JSON_KEY_DATA] = decrypt_params(
-                    response_data[JSON_KEY_DATA], key, iv
-                )
+                try:
+                    response_data[JSON_KEY_DATA] = decrypt_params(
+                        response_data[JSON_KEY_DATA], key, iv
+                    )
+                except Exception as err:  # pylint: disable=broad-except
+                    _LOGGER.warning("CSG API %s payload decryption failed", path)
+                    raise CSGAPIError("DECRYPT", f"{path}: decrypt failed") from err
             _LOGGER.debug(
                 "CSG API response path=%s status=%s",
                 path,
@@ -395,6 +407,21 @@ class CSGClient:
             return response.headers, response_data
 
         raise NotImplementedError()
+
+    def close(self) -> None:
+        """Release the HTTP session's connection pool."""
+        session = getattr(self, "_session", None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # pragma: no cover - best effort
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def _crypto_material(self) -> tuple[bytes, bytes]:
         """Return crypto material for the authenticated API channel."""
@@ -857,7 +884,15 @@ class CSGClient:
         if cache is None:
             cache = {}
             self._bill_cache = cache
-        key = (year, account.metering_point_number or account.account_number)
+        identifiers = (
+            account.area_code,
+            account.ele_customer_id,
+            account.metering_point_number,
+            account.account_number,
+        )
+        # No identifier at all: never share a cache slot across accounts.
+        cacheable = any(value for value in identifiers)
+        key = identifiers + (year,)
         cached = cache.get(key)
         now = time.time()
         if cached and now - cached[0] < BILL_CACHE_TTL:
@@ -872,28 +907,34 @@ class CSGClient:
                 account.metering_point_number,
             )
             for item in (data or {}).get("electricAndChargeList") or []:
-                raw_ym = str(item.get(JSON_KEY_YEAR_MONTH) or "")
-                digits = "".join(ch for ch in raw_ym if ch.isdigit())
-                if len(digits) >= 6:
-                    ym = digits[:6]
-                elif 0 < len(digits) <= 2:
-                    ym = f"{year}{int(digits):02d}"
-                else:
-                    continue
+                # One malformed row must not discard the whole year.
                 try:
+                    if not isinstance(item, dict):
+                        continue
+                    raw_ym = str(item.get(JSON_KEY_YEAR_MONTH) or "")
+                    digits = "".join(ch for ch in raw_ym if ch.isdigit())
+                    if len(digits) >= 6:
+                        ym = digits[:6]
+                    elif 0 < len(digits) <= 2:
+                        ym = f"{year}{int(digits):02d}"
+                    else:
+                        continue
                     charge = float(item.get("actualTotalAmount") or 0)
                     kwh = float(item.get("billingElectricity") or 0)
-                except (TypeError, ValueError):
+                    if charge > 0:
+                        rows[ym] = (charge, kwh)
+                except (TypeError, ValueError, AttributeError):
                     continue
-                if charge > 0:
-                    rows[ym] = (charge, kwh)
         except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.debug("Official bill lookup failed for year %s: %s", year, err)
-            if cached:
+            _LOGGER.warning("Official bill lookup failed for year %s: %s", year, err)
+            # Only reuse a still-fresh value; a stale one must not be served
+            # forever just because the API keeps failing.
+            if cached and now - cached[0] < BILL_CACHE_TTL:
                 return cached[1]
             return {}
 
-        cache[key] = (now, rows)
+        if cacheable:
+            cache[key] = (now, rows)
         return rows
 
     @staticmethod
@@ -1018,13 +1059,20 @@ class CSGClient:
 
         by_day = []
         for d_data in resp_data.get("result") or []:
-            item = {
-                WF_ATTR_DATE: d_data["date"],
-                WF_ATTR_KWH: float(d_data["power"]),
-            }
-            if d_data.get("charge") not in (None, ""):
-                item[WF_ATTR_CHARGE] = float(d_data["charge"])
-            by_day.append(item)
+            # Calendar fallback rows may miss fields or carry odd types.
+            try:
+                if not isinstance(d_data, dict):
+                    continue
+                raw_date = d_data.get("date")
+                raw_kwh = d_data.get("power")
+                if raw_date in (None, "") or raw_kwh in (None, ""):
+                    continue
+                item = {WF_ATTR_DATE: str(raw_date), WF_ATTR_KWH: float(raw_kwh)}
+                if d_data.get("charge") not in (None, ""):
+                    item[WF_ATTR_CHARGE] = float(d_data["charge"])
+                by_day.append(item)
+            except (TypeError, ValueError):
+                continue
 
         ladder_start_date = None
         raw_start_date = resp_data.get("ladderEleStartDate")
@@ -1034,12 +1082,16 @@ class CSGClient:
             except ValueError:
                 _LOGGER.debug("Ignoring an unparseable ladder start date")
 
-        ladder = {
-            WF_ATTR_LADDER: (
+        try:
+            ladder_value = (
                 int(resp_data["ladderEle"])
                 if resp_data.get("ladderEle") not in (None, "")
                 else None
-            ),
+            )
+        except (TypeError, ValueError):
+            ladder_value = None
+        ladder = {
+            WF_ATTR_LADDER: ladder_value,
             WF_ATTR_LADDER_START_DATE: ladder_start_date,
             WF_ATTR_LADDER_REMAINING_KWH: optional_float(
                 resp_data.get("ladderEleSurplus")
@@ -1107,18 +1159,41 @@ class CSGClient:
             account.metering_point_number,
         )
 
-        total_year_kwh = resp_data["totalBillingElectricity"]
-        total_year_charge = resp_data["totalActualAmount"]
+        def _to_float(value: Any) -> float | None:
+            if value in (None, ""):
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
         by_month = []
-        for m_data in resp_data["electricAndChargeList"]:
-            by_month.append(
-                {
-                    WF_ATTR_MONTH: m_data[JSON_KEY_YEAR_MONTH],
-                    WF_ATTR_CHARGE: float(m_data["actualTotalAmount"]),
-                    WF_ATTR_KWH: float(m_data["billingElectricity"]),
-                }
-            )
-        return float(total_year_charge), float(total_year_kwh), by_month
+        for m_data in resp_data.get("electricAndChargeList") or []:
+            try:
+                if not isinstance(m_data, dict):
+                    continue
+                month = m_data.get(JSON_KEY_YEAR_MONTH)
+                charge = _to_float(m_data.get("actualTotalAmount"))
+                kwh = _to_float(m_data.get("billingElectricity"))
+                if month in (None, "") or charge is None or kwh is None:
+                    continue
+                by_month.append(
+                    {
+                        WF_ATTR_MONTH: str(month),
+                        WF_ATTR_CHARGE: charge,
+                        WF_ATTR_KWH: kwh,
+                    }
+                )
+            except (TypeError, ValueError):
+                continue
+
+        total_charge = _to_float(resp_data.get("totalActualAmount"))
+        total_kwh = _to_float(resp_data.get("totalBillingElectricity"))
+        if total_charge is None:
+            total_charge = sum(item[WF_ATTR_CHARGE] for item in by_month)
+        if total_kwh is None:
+            total_kwh = sum(item[WF_ATTR_KWH] for item in by_month)
+        return float(total_charge), float(total_kwh), by_month
 
     def get_years_month_stats(
         self, account: CSGElectricityAccount, years: list[int]
@@ -1169,8 +1244,17 @@ class CSGClient:
                 account.metering_point_id, number,
             )
 
+        now_ts = time.time()
         if getattr(self, "_daily_endpoint_dead", False):
-            return calendar_fallback()
+            dead_since = getattr(self, "_daily_dead_since", 0.0) or 0.0
+            if now_ts - dead_since < DAILY_ENDPOINT_RETRY_SECONDS:
+                return calendar_fallback()
+            # Cooldown elapsed: probe the old endpoint again instead of staying
+            # degraded for the whole HA runtime.
+            self._daily_endpoint_dead = False
+            self._daily_dead_since = 0.0
+            self._daily_variant_index = None
+            _LOGGER.info("Retrying the CSG daily-charge endpoint after cooldown")
 
         known_good = getattr(self, "_daily_variant_index", None)
         order = (
@@ -1178,7 +1262,14 @@ class CSGClient:
             if known_good is not None
             else list(range(len(candidates)))
         )
+        started = time.time()
+        failures: list[str] = []
+        endpoint_gone = True
         for index in order:
+            if time.time() - started > DAILY_ENDPOINT_BUDGET_SECONDS:
+                failures.append(f"variant {index}: time budget exhausted")
+                endpoint_gone = False
+                break
             try:
                 _, resp_data = self._make_request(
                     "charge/queryDayElectricByMPoint",
@@ -1186,31 +1277,59 @@ class CSGClient:
                     custom_headers={},
                     encrypt_payload=self.api_profile == API_PROFILE_WEB,
                 )
-                sta = resp_data.get(JSON_KEY_STA)
-                if sta == RESP_STA_NO_LOGIN:
-                    raise NotLoggedIn(sta, resp_data.get(JSON_KEY_MESSAGE))
-                if sta == RESP_STA_SUCCESS:
-                    data = resp_data.get(JSON_KEY_DATA) or {}
-                    if data.get("result"):
-                        if getattr(self, "_daily_variant_index", None) != index:
-                            _LOGGER.info(
-                                "CSG daily detail works with payload variant %s "
-                                "(full charge/ladder data restored)", index
-                            )
-                        self._daily_variant_index = index
-                        return data
             except NotLoggedIn:
                 raise
+            except CSGHTTPError as err:
+                # Re-auth needs a real auth error, not a swallowed one.
+                if getattr(err, "status_code", 0) in (401, 403):
+                    raise
+                failures.append(f"variant {index}: HTTP {err.status_code}")
+                endpoint_gone = err.status_code in (404, 410)
+                continue
             except Exception as err:  # pylint: disable=broad-except
-                _LOGGER.debug(
-                    "CSG daily detail variant %s failed: %s", index, err
-                )
+                failures.append(f"variant {index}: {type(err).__name__}: {err}")
+                endpoint_gone = False
+                continue
 
-        self._daily_endpoint_dead = True
-        _LOGGER.info(
-            "CSG daily-charge endpoint unavailable (sta=02); using calendar "
-            "data plus official monthly bills to reconstruct charges"
-        )
+            sta = resp_data.get(JSON_KEY_STA)
+            if sta == RESP_STA_NO_LOGIN:
+                raise NotLoggedIn(sta, resp_data.get(JSON_KEY_MESSAGE))
+            if sta == RESP_STA_SUCCESS:
+                data = resp_data.get(JSON_KEY_DATA) or {}
+                if data.get("result"):
+                    if getattr(self, "_daily_variant_index", None) != index:
+                        _LOGGER.info(
+                            "CSG daily detail works with payload variant %s "
+                            "(full charge/ladder data restored)", index
+                        )
+                    self._daily_variant_index = index
+                    return data
+                failures.append(f"variant {index}: sta=00 but empty result")
+                endpoint_gone = False
+                continue
+
+            # Any sta other than "success" / "not logged in" is recorded
+            # verbatim — the old code silently dropped it and then hard-coded
+            # "sta=02" in the fallback message.
+            failures.append(f"variant {index}: sta={sta}")
+            if sta != RESP_STA_SYSTEM_ERROR:
+                endpoint_gone = False
+            _LOGGER.warning("CSG daily detail variant %s returned sta=%s", index, sta)
+
+        if endpoint_gone:
+            self._daily_endpoint_dead = True
+            self._daily_dead_since = now_ts
+            _LOGGER.info(
+                "CSG daily-charge endpoint reported gone (%s); falling back to "
+                "calendar data plus official bills, retry in %s min",
+                "; ".join(failures) or "no success",
+                int(DAILY_ENDPOINT_RETRY_SECONDS // 60),
+            )
+        else:
+            _LOGGER.warning(
+                "CSG daily detail temporarily failed (%s); will retry next update",
+                "; ".join(failures) or "no success",
+            )
         return calendar_fallback()
 
     def get_yesterday_kwh(self, account: CSGElectricityAccount) -> float | None:

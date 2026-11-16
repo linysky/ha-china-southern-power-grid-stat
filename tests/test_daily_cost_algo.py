@@ -80,6 +80,30 @@ class TierPricingTests(unittest.TestCase):
         self.assertEqual(A["_normalize_ym"]("202304"), "202304")
         self.assertEqual(A["_normalize_ym"]("bad"), "")
 
+    # ---- v1.6.1 回归：0 元账单 / 有费无电量 ----
+    def test_zero_bill_target_zero_ignores_fallback_price(self):
+        """0 元账单不能再按 fallback 基准价凭空算出电费。"""
+        rows = [(f"2026-02-{d:02d}", 7.2) for d in range(1, 29)]
+        charges, labels, base, prices = A["_tier_price_month"](
+            "202602", rows, 0.0, 0.68)
+        self.assertEqual(set(charges), {0.0})
+        self.assertEqual(len(labels), 28)
+        self.assertTrue(all(p == 0.0 for p in prices))
+
+    def test_no_spread_when_month_has_no_kwh(self):
+        """账单有电费但每日电量全为 0 时，不要把电费均摊到零电量天。"""
+        rows = [("2026-03-01", 0.0), ("2026-03-02", 0.0)]
+        charges, labels, base, prices = A["_tier_price_month"](
+            "202603", rows, 5.0, None)
+        self.assertEqual(set(charges), {0.0})
+
+    def test_tier_config_snapshot_shape(self):
+        """阶梯配置指纹：改常量应能触发缓存重算。"""
+        snap = A["_tier_config_snapshot"]()
+        for key in ("summer_thresholds", "non_summer_thresholds",
+                    "surcharges", "tariffs"):
+            self.assertIn(key, snap)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -130,6 +130,10 @@ tbody tr:hover{background:#f9fbfd}
 var RAW=null, ROWS=[], LABELS={dm:"真实每日电量 × 阶梯电价",ma:"月度账单均摊估算",cd:"集成每日明细",zb:"账单 0 元 · 真实每日电量",zm:"账单 0 元 · 电量均摊估算"};
 var COLORS={dm:"#378add",ma:"#ef9f27",cd:"#639922",zb:"#4f46e5",zm:"#9333ea"};
 var $=function(id){return document.getElementById(id)};
+var KNOWN_SOURCES={dm:1,ma:1,cd:1,zb:1,zm:1};
+function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function safeSource(v){v=String(v==null?"":v);return KNOWN_SOURCES[v]?v:"other"}
+function safeDate(v){v=String(v==null?"":v);return /^\d{4}-\d{2}-\d{2}$/.test(v)?v:"0000-00-00"}
 function fmt(n,d){return Number(n||0).toLocaleString("zh-CN",{minimumFractionDigits:d===undefined?2:d,maximumFractionDigits:d===undefined?2:d})}
 function setStatus(s){$("status").textContent=s}
 function tierLabel(t){if(!t&&t!==0){return "—"}if(typeof t==="number"){return "第 "+t+" 档"}var p=String(t).split("-");return p.length===2?("第 "+p[0]+" → "+p[1]+" 档"):String(t)}
@@ -139,7 +143,7 @@ function effPrice(r){return (Number(r.kwh)>0)?(Number(r.charge)/Number(r.kwh)).t
 function ingest(payload){
   if(!payload||!payload.accounts){throw new Error("JSON 格式不正确，缺少 accounts")}
   RAW=payload;
-  if(payload.source_labels){LABELS=Object.assign(LABELS,payload.source_labels)}
+  if(payload.source_labels){Object.keys(LABELS).forEach(function(k){var v=payload.source_labels[k];if(v!=null){LABELS[k]=String(v)}})}
   var sel=$("account"),accs=Object.keys(payload.accounts);
   sel.innerHTML="";
   accs.forEach(function(a){var o=document.createElement("option");o.value=a;o.textContent=a;sel.appendChild(o)});
@@ -166,7 +170,7 @@ function render(){
   var rows=selected(),charge=0,kwh=0,byMonth={};
   rows.forEach(function(r){charge+=Number(r.charge)||0;kwh+=Number(r.kwh)||0;
     var m=r.date.slice(0,7);if(!byMonth[m])byMonth[m]={c:0,dm:0,ma:0,cd:0};
-    byMonth[m].c+=Number(r.charge)||0;byMonth[m][r.source]=(byMonth[m][r.source]||0)+1;});
+    byMonth[m].c+=Number(r.charge)||0;var _src=safeSource(r.source);byMonth[m][_src]=(byMonth[m][_src]||0)+1;});
   $("k-days").textContent=rows.length;
   $("k-charge").innerHTML=fmt(charge)+'<span class="u"> 元</span>';
   $("k-kwh").innerHTML=fmt(kwh)+'<span class="u"> kWh</span>';
@@ -176,13 +180,13 @@ function render(){
   if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="empty">该日期范围内没有数据</td></tr>';$("table-note").textContent="";return}
   var show=rows.slice().reverse(),limit=500;
   var html=show.slice(0,limit).map(function(r){
-    return '<tr><td>'+r.date+'</td><td>'+fmt(r.kwh)+'</td><td>'+fmt(r.charge)+'</td><td>'+fixedPrice(r)+'</td><td>'+effPrice(r)+'</td><td>'+tierLabel(r.tier)+'</td><td><span class="tag '+r.source+'">'+(LABELS[r.source]||r.source)+'</span></td></tr>';
+    return '<tr><td>'+esc(safeDate(r.date))+'</td><td>'+fmt(r.kwh)+'</td><td>'+fmt(r.charge)+'</td><td>'+fixedPrice(r)+'</td><td>'+effPrice(r)+'</td><td>'+esc(tierLabel(r.tier))+'</td><td><span class="tag '+esc(safeSource(r.source))+'">'+esc(LABELS[r.source]||r.source)+'</span></td></tr>';
   }).join("");
   tb.innerHTML=html;
   $("table-note").textContent="共 "+rows.length+" 天，显示最近 "+Math.min(limit,rows.length)+" 天（倒序）";
 }
 function drawChart(byMonth){
-  var svg=$("chart"),keys=Object.keys(byMonth).sort();
+  var svg=$("chart"),keys=Object.keys(byMonth).sort().filter(function(k){return /^\d{4}-\d{2}$/.test(k)});
   if(!keys.length){svg.innerHTML="";$("chart-note").textContent="加载数据后显示";return}
   var W=1080,H=190,pad=26,max=0;
   keys.forEach(function(k){max=Math.max(max,byMonth[k].c)});
@@ -194,7 +198,7 @@ function drawChart(byMonth){
     var parts=[["dm",byMonth[k].dm],["ma",byMonth[k].ma],["cd",byMonth[k].cd]];
     var y0=H-24;
     parts.forEach(function(p){var ph=Math.round(h*p[1]/total);if(ph<=0)return;y0-=ph;
-      out+='<rect x="'+x+'" y="'+y0+'" width="'+bw+'" height="'+ph+'" fill="'+COLORS[p[0]]+'"><title>'+k+' · '+fmt(v)+' 元</title></rect>';});
+      out+='<rect x="'+x+'" y="'+y0+'" width="'+bw+'" height="'+ph+'" fill="'+COLORS[p[0]]+'"><title>'+esc(k)+' · '+fmt(v)+' 元</title></rect>';});
     if(i%Math.ceil(keys.length/12)===0)out+='<text x="'+x+'" y="'+(H-6)+'" font-size="10" fill="#6b7280">'+k.slice(2)+'</text>';
   });
   out+='<line x1="'+pad+'" y1="'+(H-24)+'" x2="'+(W-pad)+'" y2="'+(H-24)+'" stroke="#e3e6ec"/>';
@@ -228,8 +232,9 @@ Array.prototype.forEach.call(document.querySelectorAll("[data-range]"),function(
 });
 $("csv").onclick=function(){
   var rows=selected();if(!rows.length){setStatus("没有可导出的数据");return}
-  var lines=["date,kwh,charge,tier_price,unit_price,tier,source,source_label,account"];
-  rows.forEach(function(r){var fp=(r.tier_price&&Number(r.tier_price)>0)?Number(r.tier_price).toFixed(4):"";var up=(Number(r.kwh)>0)?(Number(r.charge)/Number(r.kwh)).toFixed(4):"";lines.push([r.date,r.kwh,r.charge,fp,up,r.tier||"",r.source,LABELS[r.source]||r.source,r.account].join(","))});
+  function csvCell(v){var t=String(v==null?"":v);if(/^[=+\-@\t\r]/.test(t)){t="'"+t}return '"'+t.replace(/"/g,'""')+'"'}
+  var lines=[["date","kwh","charge","tier_price","unit_price","tier","source","source_label","account"].map(csvCell).join(",")];
+  rows.forEach(function(r){var fp=(r.tier_price&&Number(r.tier_price)>0)?Number(r.tier_price).toFixed(4):"";var up=(Number(r.kwh)>0)?(Number(r.charge)/Number(r.kwh)).toFixed(4):"";lines.push([safeDate(r.date),r.kwh,r.charge,fp,up,r.tier||"",safeSource(r.source),LABELS[r.source]||r.source,r.account].map(csvCell).join(","))});
   var blob=new Blob(["\ufeff"+lines.join("\n")],{type:"text/csv;charset=utf-8"});
   var a=document.createElement("a");a.href=URL.createObjectURL(blob);
   a.download="csg_daily_cost_"+$("start").value+"_"+$("end").value+".csv";a.click();

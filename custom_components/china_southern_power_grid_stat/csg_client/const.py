@@ -6,6 +6,14 @@ from enum import Enum
 # Prevents the HA thread pool from being exhausted by hung connections.
 REQUEST_TIMEOUT = 30
 
+# Daily-charge endpoint latching: how long a "gone" verdict holds before the
+# client probes the old endpoint again. A transient network failure must not
+# disable the full charge/ladder payload for the whole HA runtime.
+DAILY_ENDPOINT_RETRY_SECONDS = 30 * 60
+# Wall-clock budget for one round of daily-detail variant probing, so a hung
+# endpoint cannot block an executor thread for 4 x REQUEST_TIMEOUT seconds.
+DAILY_ENDPOINT_BUDGET_SECONDS = 60
+
 BASE_PATH_WEB = "https://95598.csg.cn/ucs/ma/wt/"
 BASE_PATH_APP = "https://95598.csg.cn/ucs/ma/zt/"
 BASE_PATH_QR_NEW = "https://95598.csg.cn/mp/w2/wx/userauth/"

@@ -40,14 +40,38 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """
     try:
         from homeassistant.components.http import StaticPathConfig
+    except ImportError:  # HA < 2024.6: no async static path API
+        _LOGGER.warning(
+            "CSG /csg_stat needs Home Assistant 2024.6+; query page and card "
+            "will be unavailable on this version"
+        )
+        return True
 
-        assets = Path(__file__).parent / "www"
+    assets = Path(__file__).parent / "www"
+    if not assets.is_dir():
+        _LOGGER.error("CSG bundled assets are missing at %s", assets)
+        persistent_notification.async_create(
+            hass,
+            "集成自带的前端资源（查询页 / 卡片）缺失，/csg_stat 不可用。请重新下载集成。",
+            title="南方电网：前端资源缺失",
+            notification_id="csg_stat_assets_missing",
+        )
+        return True
+
+    try:
         await hass.http.async_register_static_paths(
             [StaticPathConfig("/csg_stat", str(assets), False)]
         )
         _LOGGER.debug("CSG static assets registered at /csg_stat")
     except Exception as err:  # pylint: disable=broad-except
-        _LOGGER.warning("CSG static assets unavailable: %s", err)
+        # Never pretend setup succeeded while /csg_stat is dead.
+        _LOGGER.error("CSG static assets registration failed: %s", err)
+        persistent_notification.async_create(
+            hass,
+            f"前端资源注册失败，卡片与查询页不可用：{err}",
+            title="南方电网：前端资源未注册",
+            notification_id="csg_stat_assets_failed",
+        )
     return True
 
 

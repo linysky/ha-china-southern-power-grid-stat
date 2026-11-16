@@ -24,7 +24,6 @@ const CSG_SUFFIXES = [
   'last_year_total_usage', 'last_year_total_cost',
   'last_month_total_usage', 'last_month_total_cost'
 ];
-console.log('[csg-power-card] loading...');
 const CSGPowerCard = class extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
@@ -37,6 +36,32 @@ const CSGPowerCard = class extends HTMLElement {
 
   // Account number is derived from the configured entity (or given explicitly),
   // so the same card works for every installation without editing the source.
+
+  // 多账户：从配置 / 主实体所属设备推断当前卡片对应的缴费号。
+  // 找不到时返回 null，由调用方给出可见提示，绝不静默取第一个账户。
+  _resolveAccountKey(accounts) {
+    const cfg = this._config || {};
+    const keys = Object.keys(accounts || {});
+    if (!keys.length) return null;
+    if (cfg.account && accounts[cfg.account]) return cfg.account;
+    if (cfg.account) {
+      const hit = keys.find(k => k && String(k).indexOf(String(cfg.account)) >= 0);
+      if (hit) return hit;
+    }
+    if (keys.length === 1) return keys[0];
+    const reg = (this._hass && this._hass.entities) || {};
+    const states = (this._hass && this._hass.states) || {};
+    const dev = reg[cfg.entity] && reg[cfg.entity].device_id;
+    if (dev) {
+      for (const id of Object.keys(states)) {
+        if (id.indexOf('sensor.') !== 0) continue;
+        if (!reg[id] || reg[id].device_id !== dev) continue;
+        const hit = keys.find(k => k && id.indexOf(String(k)) >= 0);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  }
 
   // ---- v1.5.3 实体自动定位 -------------------------------------------
   // 按「注册表原名 / 显示名 / ID 英文后缀」和「集成独有属性 + device_class」
@@ -711,12 +736,6 @@ const CSGPowerCard = class extends HTMLElement {
       const thisMonthDailyKwh = thisMonthDays > 0 ? totalKwh / thisMonthDays : 0;
       const lastMonthDailyKwh = lastMonthDays > 0 ? lastMonthKwh / lastMonthDays : 0;
       
-      console.log('========== 日均对比调试 ==========');
-      console.log('thisMonthDays:', thisMonthDays, 'lastMonthDays:', lastMonthDays);
-      console.log('totalKwh(本月):', totalKwh, 'lastMonthKwh(上月):', lastMonthKwh);
-      console.log('thisMonthDailyKwh(日均本月):', thisMonthDailyKwh.toFixed(2), '度/天');
-      console.log('lastMonthDailyKwh(日均上月):', lastMonthDailyKwh.toFixed(2), '度/天');
-      console.log('diff %:', lastMonthDailyKwh > 0 ? ((thisMonthDailyKwh - lastMonthDailyKwh) / lastMonthDailyKwh * 100).toFixed(1) : 'N/A');
       
       if (lastMonthDailyKwh > 0) {
         const diff = ((thisMonthDailyKwh - lastMonthDailyKwh) / lastMonthDailyKwh * 100).toFixed(1);
@@ -793,15 +812,8 @@ const CSGPowerCard = class extends HTMLElement {
   
   // 更新历史月份UI（异步数据返回后调用）
   _updateHistoryUI(dayData, periodText, viewYear, viewMonth) {
-    console.log('========== _updateHistoryUI 调试 ==========');
-    console.log('dayData条数:', dayData?.length);
-    console.log('periodText:', periodText);
-    console.log('viewYear:', viewYear, 'viewMonth:', viewMonth);
-    console.log('viewMonthOffset:', this._viewMonthOffset);
-    console.log('dayData前3条:', JSON.stringify(dayData?.slice(0,3)));
 
     if (!dayData || dayData.length === 0) {
-      console.log('dayData为空，不更新UI');
       return;
     }
 
@@ -984,7 +996,6 @@ const CSGPowerCard = class extends HTMLElement {
           kwh: per, charge: perCost, tier: '', tier_price: 0
         });
       }
-      console.log('[csg-power-card] ' + monthStr + ' 账单均摊兜底 ' + days.length + ' 天 / ' + kwh + ' 度');
       return { days, zero: false };
     };
 
@@ -1008,8 +1019,12 @@ const CSGPowerCard = class extends HTMLElement {
       .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(j => {
         const accounts = j.accounts || {};
-        const accKey = (_self._config && _self._config.account) || Object.keys(accounts)[0];
-        const blk = accounts[accKey] || accounts[Object.keys(accounts)[0]] || {};
+        const accKey = _self._resolveAccountKey(accounts);
+        if (!accKey) {
+          showEmpty('多账户请配置 account');
+          return;
+        }
+        const blk = accounts[accKey] || {};
         const days = blk.days || {};
         const allDates = Object.keys(days).sort();
         const earliest = allDates.length ? allDates[0].slice(0, 7) : null;
@@ -1027,7 +1042,6 @@ const CSGPowerCard = class extends HTMLElement {
               tier_price: row[4]
             };
           });
-        console.log('[csg-power-card] ' + monthStr + ' 从 JSON 取得 ' + dayData.length + ' 天');
         let emptyReason = null, fallbackNote = null;
         if (dayData.length === 0) {
           const fb = billFallback();
@@ -1046,7 +1060,7 @@ const CSGPowerCard = class extends HTMLElement {
         applyDays(dayData, emptyReason, fallbackNote);
       })
       .catch(e => {
-        console.log('[csg-power-card] JSON 读取失败:', e.message);
+        console.warn('[csg-power-card] JSON 读取失败:', e.message);
         showEmpty('数据文件暂不可用');
       });
   }
@@ -1055,10 +1069,6 @@ const CSGPowerCard = class extends HTMLElement {
     const calendarEl = this.shadowRoot.getElementById('calendar');
     
     // 调试日志
-    console.log('========== _renderCalendar 调试 ==========');
-    console.log('dailyData:', dailyData?.length, '条');
-    console.log('isYearly:', isYearly, 'viewYear:', viewYear, 'viewMonth:', viewMonth);
-    console.log('this._viewMonthOffset:', this._viewMonthOffset);
     
     const now = new Date();
     let year, month, today;
@@ -1080,7 +1090,6 @@ const CSGPowerCard = class extends HTMLElement {
       } else if (this._viewMonthOffset < 0) {
         // 历史月份：显示该月所有天数
         today = daysInMonth;
-        console.log('历史月份，显示', today, '天');
       } else {
         today = 0; // 下月不显示
       }
@@ -1091,9 +1100,6 @@ const CSGPowerCard = class extends HTMLElement {
     const adjustedFirstDay = firstDay === 0 ? 6 : firstDay - 1;
     
     const dataMap = {};
-    console.log('========== 日历渲染数据调试 ==========');
-    console.log('dailyData条数:', dailyData?.length);
-    console.log('dailyData前5条:', JSON.stringify(dailyData?.slice(0,5)));
     
     // 详细处理每个日期
     if (dailyData && dailyData.length > 0) {
@@ -1104,15 +1110,12 @@ const CSGPowerCard = class extends HTMLElement {
         } else {
           // 处理日期格式
           const dateStr = d.date;
-          console.log('处理第', idx+1, '条: date=', dateStr);
           if (dateStr && dateStr.includes('-')) {
             const dateParts = dateStr.split('-');
             // 可能是 "2025-02-01" 或 "2025-2-1" 格式
             const dayPart = dateParts[2]?.replace(/^0/, '') || dateParts[2]; // 去掉前导0
             key = parseInt(dayPart, 10);
-            console.log('  分割结果:', dateParts, '-> key:', key);
           } else {
-            console.log('  日期格式异常');
             key = null;
           }
         }
@@ -1122,9 +1125,6 @@ const CSGPowerCard = class extends HTMLElement {
       });
     }
     
-    console.log('dataMap keys (排序):', Object.keys(dataMap).map(k => parseInt(k)).sort((a,b)=>a-b));
-    console.log('daysInMonth:', daysInMonth);
-    console.log('数据匹配天数:', Object.keys(dataMap).length);
     
     const kwhValues = dailyData.map(d => d.kwh);
     const minKwh = kwhValues.length > 0 ? Math.min(...kwhValues) : 0;

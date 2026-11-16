@@ -8,10 +8,16 @@ import datetime
 import json
 import logging
 import os
+import tempfile
 import time
 import traceback
 from datetime import timedelta
 from typing import Any
+
+try:
+    from homeassistant.util import dt as dt_util
+except ImportError:  # pragma: no cover - very old HA
+    dt_util = None
 
 import async_timeout
 from homeassistant.components import persistent_notification
@@ -169,7 +175,7 @@ def _normalize_ym(value: str) -> str:
 
 def _target_months(earliest: str | None = None) -> list[str]:
     """Months from `earliest` (or a rolling 3-year window) up to this month."""
-    today = datetime.date.today()
+    today = _now_local().date()
     if earliest and len(earliest) >= 6:
         year, month = int(earliest[:4]), int(earliest[4:6])
     else:
@@ -246,6 +252,26 @@ def _apportion_cents(raw: list[float], target: float) -> list[float]:
     return [value / 100.0 for value in cents]
 
 
+def _tier_config_snapshot() -> dict:
+    """Fingerprint of the tier constants; compared against the cache on load."""
+    return {
+        "summer_thresholds": list(TIER_THRESHOLDS_SUMMER),
+        "non_summer_thresholds": list(TIER_THRESHOLDS_NON_SUMMER),
+        "surcharges": list(TIER_SURCHARGES),
+        "tariffs": list(TIER_TARIFFS) if TIER_TARIFFS else None,
+    }
+
+
+def _now_local() -> datetime.datetime:
+    """Now in HA's configured timezone (falls back to host local time)."""
+    if dt_util is not None:
+        try:
+            return dt_util.now()
+        except Exception:  # pragma: no cover
+            pass
+    return datetime.datetime.now()
+
+
 def _normalize_day_row(values: list) -> list:
     """Cached day row: [kwh, charge, source, tier, tier_price]."""
     row = list(values)[:5]
@@ -280,6 +306,10 @@ def _tier_price_month(
         cumulative += value
     total_kwh = cumulative
     target = float(target_charge or 0)
+    if target <= 0:
+        # 0 CNY bill (prepaid credit / not yet settled): the bill amount is
+        # the truth - keep the kWh shape but charge every day 0.
+        return _zero_bill_rows(year_month, daily_kwh)
 
     if TIER_TARIFFS and ENABLE_TIER_PRICING:
         prices = [float(p) for p in TIER_TARIFFS]
@@ -304,7 +334,7 @@ def _tier_price_month(
         for segments in per_day
     ]
     total_raw = sum(raw)
-    if total_raw <= 1e-9 and target > 0 and raw:
+    if total_raw <= 1e-9 and target > 0 and raw and total_kwh > 1e-9:
         # Defensive fallback when no usable daily kWh shape exists at all.
         raw = [target / len(raw) for _ in raw]
         total_raw = sum(raw)
@@ -378,7 +408,6 @@ class CSGDailyHistory:
         self._tier_base: dict[str, dict[str, float]] = {}
         self._loaded = False
         self._building = False
-        self._upgrade_pending = False
         self._lock = asyncio.Lock()
         self._last_error: str | None = None
 
@@ -390,7 +419,13 @@ class CSGDailyHistory:
             with open(self._path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             upgrade = payload.get("algo_version") != ALGO_VERSION
-            self._upgrade_pending = upgrade
+            if not upgrade:
+                # Tier constants edited without bumping ALGO_VERSION: cached
+                # prices are stale, so reprice from the stored daily kWh.
+                upgrade = (
+                    payload.get("tier_config") != _tier_config_snapshot()
+                    or payload.get("tier_pricing") != ENABLE_TIER_PRICING
+                )
             for account, block in (payload.get("accounts") or {}).items():
                 self._accounts[account] = {
                     str(date): _normalize_day_row(values)
@@ -422,17 +457,12 @@ class CSGDailyHistory:
         try:
             os.makedirs(os.path.dirname(self._path), exist_ok=True)
             payload = {
-                "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "generated_at": _now_local().isoformat(timespec="seconds"),
                 "algo_version": ALGO_VERSION,
                 "window_years": DAILY_HISTORY_YEARS,
                 "keep_all_history": KEEP_ALL_HISTORY,
                 "tier_pricing": ENABLE_TIER_PRICING,
-                "tier_config": {
-                    "summer_thresholds": list(TIER_THRESHOLDS_SUMMER),
-                    "non_summer_thresholds": list(TIER_THRESHOLDS_NON_SUMMER),
-                    "surcharges": list(TIER_SURCHARGES),
-                    "tariffs": list(TIER_TARIFFS) if TIER_TARIFFS else None,
-                },
+                "tier_config": _tier_config_snapshot(),
                 "unit": {"kwh": "kWh", "charge": "CNY"},
                 "day_fields": ["kwh", "charge", "source", "tier", "tier_price"],
                 "source_labels": SRC_LABELS,
@@ -454,10 +484,23 @@ class CSGDailyHistory:
                     for account, days in accounts.items()
                 },
             }
-            tmp_path = self._path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-            os.replace(tmp_path, self._path)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                prefix=DAILY_HISTORY_FILENAME + ".",
+                suffix=".tmp",
+                dir=os.path.dirname(self._path) or None,
+            )
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        payload, handle, ensure_ascii=False, separators=(",", ":")
+                    )
+                os.replace(tmp_path, self._path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         except Exception as err:  # pylint: disable=broad-except
             _LOGGER.warning("Could not write daily cost cache: %s", err)
 
@@ -536,7 +579,13 @@ class CSGDailyHistory:
                 parsed.append((date, kwh, charge))
             if not parsed:
                 continue
-            target = sum(charge for _, _, charge in parsed)
+            bill = bills.get(year_month)
+            if bill is not None:
+                # The official monthly bill is the source of truth; the
+                # coordinator's per-day charge is only an estimate.
+                target = float(bill[0] or 0)
+            else:
+                target = sum(charge for _, _, charge in parsed)
             charges, labels, base, applied = _tier_price_month(
                 year_month,
                 [(date, kwh) for date, kwh, _ in parsed],
@@ -557,23 +606,32 @@ class CSGDailyHistory:
         # 2) Older months: newest first, so a recent success is found early.
         # v4: a month cached as a 0 CNY bill must be repriced if the grid
         # later publishes a real charge for it (prepaid credit settled).
-        zero_cached = {
-            date[:4] + date[5:7]
-            for date, values in days.items()
-            if values[2] in (SRC_ZERO_BILL_DM, SRC_ZERO_BILL_MA)
-        }
-        pending = sorted(
-            (
-                ym for ym in months
-                if ym not in recent
-                and (
-                    ym not in done
-                    or (
-                        ym in zero_cached
-                        and (bills.get(ym) or (0, 0))[0] > 0
-                    )
+        cached_charge: dict[str, float] = {}
+        for date, values in days.items():
+            ym_key = date[:4] + date[5:7]
+            try:
+                cached_charge[ym_key] = cached_charge.get(ym_key, 0.0) + float(
+                    values[1] or 0
                 )
-            ),
+            except (TypeError, ValueError, IndexError):
+                continue
+
+        def _needs_reprice(ym: str) -> bool:
+            """Reprice whenever the cached total disagrees with the official bill."""
+            bill = bills.get(ym)
+            if bill is None:
+                return ym not in done
+            cached_total = cached_charge.get(ym)
+            if cached_total is None:
+                return True
+            try:
+                bill_charge = float(bill[0] or 0)
+            except (TypeError, ValueError):
+                return True
+            return abs(cached_total - bill_charge) > 0.005
+
+        pending = sorted(
+            (ym for ym in months if ym not in recent and _needs_reprice(ym)),
             reverse=True,
         )
         consecutive_failures = 0
@@ -584,7 +642,7 @@ class CSGDailyHistory:
                 continue
             # v4: charge==0 is a valid bill (prepaid credit / not settled).
             # Only a missing month is skipped; kWh must still be displayed.
-            zero_bill = bill[0] <= 0
+            zero_bill = bill[0] == 0
             year, month = int(year_month[:4]), int(year_month[4:])
             bill_charge, bill_kwh = bill
             day_count = calendar.monthrange(year, month)[1]
@@ -699,7 +757,7 @@ class CSGDailyHistory:
         # 3) Keep-all mode never trims. Otherwise drop data older than the window.
         if not KEEP_ALL_HISTORY:
             cutoff = (
-                datetime.date.today()
+                _now_local().date()
                 - datetime.timedelta(days=365 * DAILY_HISTORY_YEARS)
             ).isoformat()
             for date in list(days):
@@ -748,7 +806,6 @@ class CSGDailyHistory:
                 self._done[account_number] = done
                 self._tier_base[account_number] = tier_base
                 self._last_error = None
-                self._upgrade_pending = False
                 _LOGGER.info(
                     "Daily cost history ready for %s: %s days, %s tier months, "
                     "%s meter months, %s reused, %s estimated",
@@ -771,12 +828,28 @@ class CSGDailyHistory:
     ) -> dict:
         if not self._loaded:
             await self._hass.async_add_executor_job(self._load_sync)
-        today = datetime.date.today()
-        end_date = (end or today.isoformat())[:10]
-        start_date = (
-            start
-            or (today - datetime.timedelta(days=365 * DAILY_HISTORY_YEARS)).isoformat()
-        )[:10]
+        today = _now_local().date()
+
+        def _parse_day(value: str | None, label: str) -> datetime.date | None:
+            if value is None or value == "":
+                return None
+            if not isinstance(value, str):
+                raise ValueError(f"{label} 必须是 YYYY-MM-DD 字符串")
+            try:
+                return datetime.date.fromisoformat(value.strip()[:10])
+            except ValueError as err:
+                raise ValueError(
+                    f"{label} 格式无效：{value!r}（需要 YYYY-MM-DD）"
+                ) from err
+
+        end_day = _parse_day(end, "end") or today
+        start_day = _parse_day(start, "start") or (
+            today - datetime.timedelta(days=365 * DAILY_HISTORY_YEARS)
+        )
+        if start_day > end_day:
+            raise ValueError("start 不能晚于 end")
+        end_date = end_day.isoformat()
+        start_date = start_day.isoformat()
 
         if not account:
             if len(self._accounts) == 1:
@@ -786,6 +859,12 @@ class CSGDailyHistory:
                     "error": "account_required",
                     "available_accounts": sorted(self._accounts),
                 }
+        elif account not in self._accounts:
+            return {
+                "error": "account_not_found",
+                "account": account,
+                "available_accounts": sorted(self._accounts),
+            }
         rows = []
         for date in sorted(self._accounts.get(account, {})):
             if not (start_date <= date <= end_date):
@@ -839,6 +918,9 @@ async def async_setup_entry(
         _LOGGER.info("No ele accounts in config, exit entry setup")
         return
     coordinator = CSGCoordinator(hass, config_entry)
+    hass.data.setdefault(DOMAIN, {}).setdefault(config_entry.entry_id, {})[
+        "coordinator"
+    ] = coordinator
 
     all_sensors = []
     for ele_account_number, _ in config_entry.data[CONF_ELE_ACCOUNTS].items():
@@ -949,19 +1031,54 @@ async def async_setup_entry(
     async def _handle_query_daily_cost(call):
         """Service: china_southern_power_grid_stat.query_daily_cost"""
         data = call.data
-        return await coordinator.daily_history.async_query(
-            data.get("account"), data.get("start"), data.get("end")
+        account = data.get("account")
+        histories = []
+        for entry_data in (hass.data.get(DOMAIN) or {}).values():
+            if not isinstance(entry_data, dict):
+                continue
+            history = getattr(entry_data.get("coordinator"), "daily_history", None)
+            if history is not None:
+                histories.append(history)
+        if not histories:
+            raise ValueError("集成尚未完成初始化，请稍后再试")
+        if account:
+            for history in histories:
+                if account in getattr(history, "_accounts", {}):
+                    return await history.async_query(
+                        account, data.get("start"), data.get("end")
+                    )
+        return await histories[0].async_query(
+            account, data.get("start"), data.get("end")
         )
 
     register_kwargs = {}
     if SupportsResponse is not None:
         register_kwargs["supports_response"] = SupportsResponse.OPTIONAL
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_QUERY_DAILY_COST,
-        _handle_query_daily_cost,
-        **register_kwargs,
-    )
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    if not domain_data.get("__service_registered__"):
+        domain_data["__service_registered__"] = True
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_QUERY_DAILY_COST,
+            _handle_query_daily_cost,
+            **register_kwargs,
+        )
+
+    def _release_service_if_last() -> None:
+        remaining = [
+            key for key in (hass.data.get(DOMAIN) or {}) if not str(key).startswith("__")
+        ]
+        if remaining:
+            return
+        (hass.data.get(DOMAIN) or {}).pop("__service_registered__", None)
+        try:
+            hass.services.async_remove(DOMAIN, SERVICE_QUERY_DAILY_COST)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    on_unload = getattr(config_entry, "async_on_unload", None)
+    if on_unload is not None:
+        on_unload(_release_service_if_last)
 
     # Schedule the first update to run in the background
     config_entry.async_create_task(
@@ -1604,7 +1721,7 @@ class CSGCoordinator(DataUpdateCoordinator):
         }
 
     def _update_states(self):
-        current_dt = datetime.datetime.now()
+        current_dt = _now_local()
         this_year, this_month, this_day = (
             current_dt.year,
             current_dt.month,
@@ -1735,6 +1852,14 @@ class CSGCoordinator(DataUpdateCoordinator):
                 result[f"{year:04d}{month:02d}"] = rows
         return result
 
+    async def _run_daily_history_bg(self) -> None:
+        """Background wrapper: a failure before async_build must not be silent."""
+        try:
+            await self._async_update_daily_history()
+        except Exception as err:  # pylint: disable=broad-except
+            self._last_error = str(err)
+            _LOGGER.warning("Daily cost history background task failed: %s", err)
+
     async def _async_update_daily_history(self) -> None:
         """Refresh the daily cost history in the background."""
         if self._client is None:
@@ -1825,7 +1950,7 @@ class CSGCoordinator(DataUpdateCoordinator):
         # so it never slows down the normal sensor update.
         if self._daily_history_task is None or self._daily_history_task.done():
             self._daily_history_task = self.hass.async_create_task(
-                self._async_update_daily_history(),
+                self._run_daily_history_bg(),
                 f"{self._config_entry_id}_daily_cost_history",
             )
         return self._gathered_data
