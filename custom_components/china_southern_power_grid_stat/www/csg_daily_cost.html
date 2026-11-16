@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>南方电网 · 每日电费查询</title>
+<style>
+:root{--bg:#f7f8fa;--card:#fff;--line:#e3e6ec;--txt:#20242b;--muted:#6b7280;--accent:#185fa5;--accent-soft:#e6f1fb;--amber:#854f0b;--amber-soft:#faeeda;--green:#3b6d11;--green-soft:#eaf3de}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1120px;margin:0 auto;padding:24px 20px 60px}
+h1{font-size:20px;font-weight:500;margin:0 0 4px}
+.sub{color:var(--muted);font-size:13px;margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:16px}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+label{font-size:12px;color:var(--muted);display:block;margin-bottom:4px}
+input,select,button{font:inherit;font-size:13px;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--txt)}
+input[type=date]{min-width:140px}
+button{cursor:pointer;background:var(--accent-soft);border-color:#b5d4f4;color:#0c447c}
+button:hover{background:#d7e9fb}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.ghost{background:#fff}
+#base{min-width:260px;flex:1}
+.hint{font-size:12px;color:var(--muted);margin-top:8px}
+.status{font-size:12px;color:var(--muted);margin-left:auto}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.kpi .k{font-size:12px;color:var(--muted)}
+.kpi .v{font-size:22px;font-weight:500;margin-top:4px;font-variant-numeric:tabular-nums}
+.kpi .u{font-size:12px;color:var(--muted);font-weight:400}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:10px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
+table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:7px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:500;font-size:12px;position:sticky;top:0;background:#fff}
+th:first-child,td:first-child,th:last-child,td:last-child{text-align:left}
+tbody tr:hover{background:#f9fbfd}
+.tag{font-size:11px;padding:1px 7px;border-radius:10px;white-space:nowrap}
+.tag.dm{background:var(--accent-soft);color:#0c447c}
+.tag.ma{background:var(--amber-soft);color:var(--amber)}
+.tag.cd{background:var(--green-soft);color:var(--green)}
+.tag.zb{background:#e8ecff;color:#3730a3}
+.tag.zm{background:#f3e8ff;color:#6b21a8}
+.scroll{max-height:460px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+.chart{width:100%;height:190px;display:block}
+.empty{padding:28px;text-align:center;color:var(--muted)}
+.foot{font-size:12px;color:var(--muted);line-height:1.8}
+@media(max-width:720px){.grid{grid-template-columns:repeat(2,1fr)}#base{min-width:100%}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>南方电网 · 每日电费查询</h1>
+  <p class="sub">数据来自本集成生成的每日电费缓存，随集成更新自动刷新；所有数据只保存在你自己的 Home Assistant 上。</p>
+
+  <div class="card">
+    <div class="row">
+      <div style="flex:1;min-width:240px">
+        <label>Home Assistant 地址</label>
+        <input id="base" value="" placeholder="留空 = 当前 Home Assistant 地址">
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button class="primary" id="load">从 HA 加载</button>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <label class="ghost" for="file" style="padding:7px 10px;border:1px solid var(--line);border-radius:8px;cursor:pointer;margin:0">或选择本地 JSON</label>
+        <input type="file" id="file" accept=".json,application/json" style="display:none">
+      </div>
+      <span class="status" id="status">尚未加载数据</span>
+    </div>
+    <div class="hint">在 HA 里打开本页（<code>/csg_stat/csg_daily_cost.html</code>）会自动加载；若填写了其它 HA 地址或双击本地文件打开被跨域拦截，请用「选择本地 JSON」。</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div><label>缴费号</label><select id="account" style="min-width:200px"><option>请先加载数据</option></select></div>
+      <div><label>开始日期</label><input type="date" id="start"></div>
+      <div><label>结束日期</label><input type="date" id="end"></div>
+      <div><label>&nbsp;</label><button id="apply">查询</button></div>
+      <div><label>&nbsp;</label><button class="ghost" data-range="1">近 1 年</button></div>
+      <div><label>&nbsp;</label><button class="ghost" data-range="3">近 3 年</button></div>
+      <div><label>&nbsp;</label><button class="ghost" data-range="year">今年</button></div>
+      <div><label>&nbsp;</label><button class="ghost" id="csv">导出 CSV</button></div>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="background:#378add"></i>真实每日电量 × 账单单价</span>
+      <span><i class="dot" style="background:#ef9f27"></i>月度账单均摊估算</span>
+      <span><i class="dot" style="background:#639922"></i>集成当月/上月明细</span>
+      <span><i class="dot" style="background:#4f46e5"></i>账单 0 元（预缴抵扣）· 真实每日电量</span>
+      <span><i class="dot" style="background:#9333ea"></i>账单 0 元（预缴抵扣）· 电量均摊估算</span>
+    </div>
+  </div>
+
+  <div class="grid" id="kpis">
+    <div class="kpi"><div class="k">天数</div><div class="v" id="k-days">—</div></div>
+    <div class="kpi"><div class="k">合计电费</div><div class="v" id="k-charge">—<span class="u"> 元</span></div></div>
+    <div class="kpi"><div class="k">合计电量</div><div class="v" id="k-kwh">—<span class="u"> kWh</span></div></div>
+    <div class="kpi"><div class="k">日均电费</div><div class="v" id="k-avg">—<span class="u"> 元</span></div></div>
+  </div>
+
+  <div class="card">
+    <div style="font-size:14px;font-weight:500;margin-bottom:8px">按月电费趋势</div>
+    <svg class="chart" id="chart" viewBox="0 0 1080 190" preserveAspectRatio="none"></svg>
+    <div class="hint" id="chart-note">加载数据后显示</div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <div style="font-size:14px;font-weight:500">每日明细</div>
+      <span class="status" id="table-note"></span>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>日期</th><th>电量 (kWh)</th><th>电费 (元)</th><th>档位电价</th><th>实算单价</th><th>阶梯档</th><th>数据来源</th></tr></thead>
+        <tbody id="tbody"><tr><td colspan="7" class="empty">请先加载数据</td></tr></tbody>
+      </table>
+    </div>
+    <div class="hint" style="margin-top:8px">档位电价 = 当月账单反解出的实际电价，同一档位内固定不变；跨档当天显示按电量加权的混合价。实算单价 = 电费 ÷ 电量，因电费按「分」记账会有 ±0.0005 左右的微小抖动，属正常现象。账单 0 元的月份档位电价与实算单价显示为「—」（电费真值为 0），电量仍为真实值。</div>
+  </div>
+
+  <p class="foot">
+    说明：南网已下线每日电费接口，页面中的每日电费按「当日电量所落的阶梯档」计价，第一档基准价由官方账单反解，<b>每月合计精确等于南网账单真实值</b>；跨档月份月末单价会高于月初。按分记账产生的尾差已分摊到各天，不再集中于月末。历史每日电量查不到的月份按账单均摊，并以橙色标注。<b>账单电费为 0 的月份（预缴抵扣 / 未出账）电费按账单真值 0 显示，用电量仍按南网真实每日电量显示，来源标记 zb/zm</b>；若日后电网补出正式账单，该月会自动重新计价。历史数据永久保留、只增不删。<br>
+    如需在 HA 内按日期范围程序化查询，可调用服务 <code>china_southern_power_grid_stat.query_daily_cost</code>（参数 start / end / account）。
+  </p>
+</div>
+
+<script>
+var RAW=null, ROWS=[], LABELS={dm:"真实每日电量 × 阶梯电价",ma:"月度账单均摊估算",cd:"集成每日明细",zb:"账单 0 元 · 真实每日电量",zm:"账单 0 元 · 电量均摊估算"};
+var COLORS={dm:"#378add",ma:"#ef9f27",cd:"#639922",zb:"#4f46e5",zm:"#9333ea"};
+var $=function(id){return document.getElementById(id)};
+function fmt(n,d){return Number(n||0).toLocaleString("zh-CN",{minimumFractionDigits:d===undefined?2:d,maximumFractionDigits:d===undefined?2:d})}
+function setStatus(s){$("status").textContent=s}
+function tierLabel(t){if(!t&&t!==0){return "—"}if(typeof t==="number"){return "第 "+t+" 档"}var p=String(t).split("-");return p.length===2?("第 "+p[0]+" → "+p[1]+" 档"):String(t)}
+function fixedPrice(r){var p=r.tier_price;if(p===undefined||p===null||p===""){return "—"}p=Number(p);return (isFinite(p)&&p>0)?p.toFixed(4):"—"}
+function effPrice(r){return (Number(r.kwh)>0)?(Number(r.charge)/Number(r.kwh)).toFixed(4):"—"}
+
+function ingest(payload){
+  if(!payload||!payload.accounts){throw new Error("JSON 格式不正确，缺少 accounts")}
+  RAW=payload;
+  if(payload.source_labels){LABELS=Object.assign(LABELS,payload.source_labels)}
+  var sel=$("account"),accs=Object.keys(payload.accounts);
+  sel.innerHTML="";
+  accs.forEach(function(a){var o=document.createElement("option");o.value=a;o.textContent=a;sel.appendChild(o)});
+  var all=[];
+  accs.forEach(function(a){
+    var days=(payload.accounts[a]||{}).days||{};
+    var arr=Array.isArray(days)?days:Object.keys(days).map(function(d){var v=days[d];return {date:d,kwh:v[0],charge:v[1],source:v[2],tier:v[3]||"",tier_price:v[4]||0}});
+    arr.forEach(function(r){r.account=a;all.push(r)});
+  });
+  all.sort(function(x,y){return x.date<y.date?-1:x.date>y.date?1:0});
+  ROWS=all;
+  if(all.length){
+    if(!$("start").value)$("start").value=all[0].date;
+    if(!$("end").value)$("end").value=all[all.length-1].date;
+  }
+  setStatus("已加载 "+all.length+" 天 · "+(payload.generated_at||"")+" 生成");
+  render();
+}
+function selected(){
+  var a=$("account").value,s=$("start").value,e=$("end").value;
+  return ROWS.filter(function(r){return (!a||r.account===a)&&(!s||r.date>=s)&&(!e||r.date<=e)});
+}
+function render(){
+  var rows=selected(),charge=0,kwh=0,byMonth={};
+  rows.forEach(function(r){charge+=Number(r.charge)||0;kwh+=Number(r.kwh)||0;
+    var m=r.date.slice(0,7);if(!byMonth[m])byMonth[m]={c:0,dm:0,ma:0,cd:0};
+    byMonth[m].c+=Number(r.charge)||0;byMonth[m][r.source]=(byMonth[m][r.source]||0)+1;});
+  $("k-days").textContent=rows.length;
+  $("k-charge").innerHTML=fmt(charge)+'<span class="u"> 元</span>';
+  $("k-kwh").innerHTML=fmt(kwh)+'<span class="u"> kWh</span>';
+  $("k-avg").innerHTML=(rows.length?fmt(charge/rows.length):"—")+'<span class="u"> 元</span>';
+  drawChart(byMonth);
+  var tb=$("tbody");
+  if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="empty">该日期范围内没有数据</td></tr>';$("table-note").textContent="";return}
+  var show=rows.slice().reverse(),limit=500;
+  var html=show.slice(0,limit).map(function(r){
+    return '<tr><td>'+r.date+'</td><td>'+fmt(r.kwh)+'</td><td>'+fmt(r.charge)+'</td><td>'+fixedPrice(r)+'</td><td>'+effPrice(r)+'</td><td>'+tierLabel(r.tier)+'</td><td><span class="tag '+r.source+'">'+(LABELS[r.source]||r.source)+'</span></td></tr>';
+  }).join("");
+  tb.innerHTML=html;
+  $("table-note").textContent="共 "+rows.length+" 天，显示最近 "+Math.min(limit,rows.length)+" 天（倒序）";
+}
+function drawChart(byMonth){
+  var svg=$("chart"),keys=Object.keys(byMonth).sort();
+  if(!keys.length){svg.innerHTML="";$("chart-note").textContent="加载数据后显示";return}
+  var W=1080,H=190,pad=26,max=0;
+  keys.forEach(function(k){max=Math.max(max,byMonth[k].c)});
+  if(max<=0)max=1;
+  var bw=Math.max(4,(W-pad*2)/keys.length-3),out="";
+  keys.forEach(function(k,i){
+    var v=byMonth[k].c,h=Math.round(v/max*(H-40)),x=pad+i*((W-pad*2)/keys.length),y=H-24-h;
+    var total=byMonth[k].dm+byMonth[k].ma+byMonth[k].cd||1;
+    var parts=[["dm",byMonth[k].dm],["ma",byMonth[k].ma],["cd",byMonth[k].cd]];
+    var y0=H-24;
+    parts.forEach(function(p){var ph=Math.round(h*p[1]/total);if(ph<=0)return;y0-=ph;
+      out+='<rect x="'+x+'" y="'+y0+'" width="'+bw+'" height="'+ph+'" fill="'+COLORS[p[0]]+'"><title>'+k+' · '+fmt(v)+' 元</title></rect>';});
+    if(i%Math.ceil(keys.length/12)===0)out+='<text x="'+x+'" y="'+(H-6)+'" font-size="10" fill="#6b7280">'+k.slice(2)+'</text>';
+  });
+  out+='<line x1="'+pad+'" y1="'+(H-24)+'" x2="'+(W-pad)+'" y2="'+(H-24)+'" stroke="#e3e6ec"/>';
+  svg.innerHTML=out;
+  $("chart-note").textContent="共 "+keys.length+" 个月 · 峰值 "+fmt(max)+" 元/月；颜色按数据来源占比堆叠";
+}
+$("load").onclick=function(){
+  var base=($("base").value||"").replace(/\/$/,"");
+  setStatus("加载中…");
+  fetch((base||"")+"/local/csg_daily_cost_history.json?_="+Date.now())
+    .then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()})
+    .then(function(j){ingest(j)})
+    .catch(function(e){setStatus("加载失败："+e.message+"（可改用本地 JSON 文件）")});
+};
+$("file").onchange=function(ev){
+  var f=ev.target.files[0];if(!f)return;
+  var rd=new FileReader();
+  rd.onload=function(){try{ingest(JSON.parse(rd.result));setStatus("已从本地文件加载："+f.name)}catch(e){setStatus("解析失败："+e.message)}};
+  rd.readAsText(f);
+};
+$("apply").onclick=render;
+["start","end"].forEach(function(id){$(id).onchange=render});
+$("account").onchange=render;
+Array.prototype.forEach.call(document.querySelectorAll("[data-range]"),function(b){
+  b.onclick=function(){
+    var n=Number(b.getAttribute("data-range")),today=new Date(),end=today.toISOString().slice(0,10),start;
+    if(b.getAttribute("data-range")==="year"){start=today.getFullYear()+"-01-01"}
+    else{var d=new Date(today);d.setFullYear(d.getFullYear()-n);start=d.toISOString().slice(0,10)}
+    $("start").value=start;$("end").value=end;render();
+  };
+});
+$("csv").onclick=function(){
+  var rows=selected();if(!rows.length){setStatus("没有可导出的数据");return}
+  var lines=["date,kwh,charge,tier_price,unit_price,tier,source,source_label,account"];
+  rows.forEach(function(r){var fp=(r.tier_price&&Number(r.tier_price)>0)?Number(r.tier_price).toFixed(4):"";var up=(Number(r.kwh)>0)?(Number(r.charge)/Number(r.kwh)).toFixed(4):"";lines.push([r.date,r.kwh,r.charge,fp,up,r.tier||"",r.source,LABELS[r.source]||r.source,r.account].join(","))});
+  var blob=new Blob(["\ufeff"+lines.join("\n")],{type:"text/csv;charset=utf-8"});
+  var a=document.createElement("a");a.href=URL.createObjectURL(blob);
+  a.download="csg_daily_cost_"+$("start").value+"_"+$("end").value+".csv";a.click();
+  setStatus("已导出 "+rows.length+" 行 CSV");
+};
+if (location.protocol === "http:" || location.protocol === "https:") {
+  $("load").click();
+}
+</script>
+</body>
+</html>

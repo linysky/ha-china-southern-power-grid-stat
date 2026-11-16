@@ -89,6 +89,34 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# CSG 电费 / 阶梯数据恢复补丁 (2026-11-13)
+# 南网已下线 charge/queryDayElectricByMPoint 的电费与阶梯字段（返回 sta=02），
+# 原代码直接回退到只含电量的日历接口，导致 6 个传感器恒为 unknown。
+# 本补丁：
+#   1. 对每日明细接口尝试多种参数组合，若只是参数变更则完整恢复全部字段；
+#   2. 仍失败时用官方账单接口 charge/getAnalyzeFeeDetails 补回电费
+#      （上月电费 = 账单真实值；当月 / 每日 = 按账单实际单价估算）；
+#   3. 阶梯三项按本地阶梯规则估算（南网已不再下发）。
+# 只需替换本文件；实体 ID、配置项、仪表盘均不变。
+# ---------------------------------------------------------------------------
+ENABLE_BILL_RECONCILIATION = True   # 改为 False 则电费维持原样（unknown）
+ENABLE_LADDER_ESTIMATE = True       # 改为 False 则三个阶梯传感器维持 unknown
+
+# 阶梯按月用电量分档，单位 kWh。默认值 = 广东电网居民生活用电
+# （夏季 5-10 月 / 非夏季 11-4 月）。若不在广东，请改成当地标准。
+LADDER_THRESHOLDS_SUMMER = (260, 600)
+LADDER_THRESHOLDS_NON_SUMMER = (200, 400)
+
+# 各档电价（元/kWh）。None = 使用官方账单反推的综合单价，不编造电价；
+# 需要精确分档电价时改成例如 (0.68, 0.73, 0.98)。
+LADDER_TARIFFS = None
+
+# 账单接口结果缓存秒数，避免一次更新内重复请求
+BILL_CACHE_TTL = 1800
+# ---------------------------------------------------------------------------
+
+
 class CSGAPIError(Exception):
     """Generic API errors"""
 
@@ -816,6 +844,161 @@ class CSGClient:
             result.append(account)
         return result
 
+    def _official_monthly_bills(
+        self, account: CSGElectricityAccount, year: int
+    ) -> dict[str, tuple[float, float]]:
+        """Return {"YYYYMM": (charge, kWh)} from the maintained official bill API.
+
+        charge/getAnalyzeFeeDetails still works even though the daily-charge
+        endpoint was withdrawn. Result is cached briefly because the coordinator
+        asks for this month, last month and yesterday in the same update pass.
+        """
+        cache = getattr(self, "_bill_cache", None)
+        if cache is None:
+            cache = {}
+            self._bill_cache = cache
+        key = (year, account.metering_point_number or account.account_number)
+        cached = cache.get(key)
+        now = time.time()
+        if cached and now - cached[0] < BILL_CACHE_TTL:
+            return cached[1]
+
+        rows: dict[str, tuple[float, float]] = {}
+        try:
+            data = self.api_get_fee_analyze_details(
+                year,
+                account.area_code,
+                account.ele_customer_id,
+                account.metering_point_number,
+            )
+            for item in (data or {}).get("electricAndChargeList") or []:
+                raw_ym = str(item.get(JSON_KEY_YEAR_MONTH) or "")
+                digits = "".join(ch for ch in raw_ym if ch.isdigit())
+                if len(digits) >= 6:
+                    ym = digits[:6]
+                elif 0 < len(digits) <= 2:
+                    ym = f"{year}{int(digits):02d}"
+                else:
+                    continue
+                try:
+                    charge = float(item.get("actualTotalAmount") or 0)
+                    kwh = float(item.get("billingElectricity") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if charge > 0:
+                    rows[ym] = (charge, kwh)
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug("Official bill lookup failed for year %s: %s", year, err)
+            if cached:
+                return cached[1]
+            return {}
+
+        cache[key] = (now, rows)
+        return rows
+
+    @staticmethod
+    def _bill_unit_price(
+        rows: dict[str, tuple[float, float]], target_ym: str
+    ) -> float | None:
+        """Pick a real average price (CNY/kWh) from the newest settled bill."""
+        if target_ym in rows and rows[target_ym][1] > 0:
+            return rows[target_ym][0] / rows[target_ym][1]
+        for ym in sorted(rows, reverse=True):
+            charge, kwh = rows[ym]
+            if kwh > 0 and charge > 0:
+                return charge / kwh
+        return None
+
+    def _reconcile_cost_data(
+        self,
+        account: CSGElectricityAccount,
+        year: int,
+        month: int,
+        month_cost: float | None,
+        month_kwh: float | None,
+        by_day: list[dict],
+    ) -> tuple[float | None, float | None]:
+        """Fill in missing charge values using the official bill API."""
+        if not ENABLE_BILL_RECONCILIATION:
+            return month_cost, month_kwh
+        if month_cost is not None and by_day and all(
+            item.get(WF_ATTR_CHARGE) is not None for item in by_day
+        ):
+            # Full official payload: nothing to reconstruct, skip the extra call.
+            return month_cost, month_kwh
+
+        rows = self._official_monthly_bills(account, year)
+        target_ym = f"{year}{month:02d}"
+        official = rows.get(target_ym)
+        if official and official[0] > 0 and month_cost is None:
+            # Settled month: use the exact billed amount, not an estimate.
+            month_cost = round(official[0], 2)
+            _LOGGER.debug(
+                "Using official billed charge %s for %s", official[0], target_ym
+            )
+
+        unit_price = self._bill_unit_price(rows, target_ym)
+        if not unit_price or unit_price <= 0:
+            _LOGGER.debug("No usable bill price for %s", target_ym)
+            return month_cost, month_kwh
+
+        if month_kwh is None and by_day:
+            month_kwh = sum(
+                float(item.get(WF_ATTR_KWH) or 0) for item in by_day
+            )
+        if month_cost is None and month_kwh is not None:
+            month_cost = round(month_kwh * unit_price, 2)
+            _LOGGER.debug(
+                "Estimated charge %s for %s from %.4f CNY/kWh",
+                month_cost, target_ym, unit_price,
+            )
+
+        for item in by_day:
+            if item.get(WF_ATTR_CHARGE) is None:
+                item[WF_ATTR_CHARGE] = round(
+                    float(item.get(WF_ATTR_KWH) or 0) * unit_price, 2
+                )
+        return month_cost, month_kwh
+
+    def _estimate_ladder(
+        self,
+        year: int,
+        month: int,
+        month_kwh: float | None,
+        unit_price: float | None,
+        ladder: dict,
+    ) -> dict:
+        """Derive ladder values locally when CSG no longer publishes them."""
+        if (
+            not ENABLE_LADDER_ESTIMATE
+            or ladder.get(WF_ATTR_LADDER) is not None
+            or month_kwh is None
+        ):
+            return ladder
+
+        first, second = (
+            LADDER_THRESHOLDS_SUMMER
+            if 5 <= month <= 10
+            else LADDER_THRESHOLDS_NON_SUMMER
+        )
+        if month_kwh <= first:
+            stage, remaining = 1, first - month_kwh
+        elif month_kwh <= second:
+            stage, remaining = 2, second - month_kwh
+        else:
+            stage, remaining = 3, 0.0
+
+        tariff = LADDER_TARIFFS[stage - 1] if LADDER_TARIFFS else unit_price
+        ladder[WF_ATTR_LADDER] = stage
+        ladder[WF_ATTR_LADDER_REMAINING_KWH] = round(max(0.0, remaining), 2)
+        ladder[WF_ATTR_LADDER_TARIFF] = round(tariff, 4) if tariff else None
+        ladder[WF_ATTR_LADDER_START_DATE] = datetime.datetime(year, month, 1)
+        _LOGGER.debug(
+            "Estimated ladder stage %s, remaining %.2f kWh, tariff %s for %s-%02d",
+            stage, remaining, tariff, year, month,
+        )
+        return ladder
+
     def get_month_daily_detail(
         self, account: CSGElectricityAccount, year_month: tuple[int, int]
     ) -> tuple[float | None, float | None, dict, list[dict[str, str | float]]]:
@@ -864,12 +1047,23 @@ class CSGClient:
             WF_ATTR_LADDER_TARIFF: optional_float(resp_data.get("ladderEleTariff")),
         }
 
-        return (
-            optional_float(resp_data.get("totalElectricity")),
-            optional_float(resp_data.get("totalPower")),
-            ladder,
-            by_day,
+        month_cost = optional_float(resp_data.get("totalElectricity"))
+        month_kwh = optional_float(resp_data.get("totalPower"))
+        month_cost, month_kwh = self._reconcile_cost_data(
+            account, year, month, month_cost, month_kwh, by_day
         )
+        if ENABLE_LADDER_ESTIMATE and ladder.get(WF_ATTR_LADDER) is None:
+            rows = (
+                self._official_monthly_bills(account, year)
+                if ENABLE_BILL_RECONCILIATION
+                else {}
+            )
+            unit_price = self._bill_unit_price(rows, f"{year}{month:02d}")
+            ladder = self._estimate_ladder(
+                year, month, month_kwh, unit_price, ladder
+            )
+
+        return (month_cost, month_kwh, ladder, by_day)
 
     def get_month_daily_usage_detail(
         self, account: CSGElectricityAccount, year_month: tuple[int, int]
@@ -937,18 +1131,87 @@ class CSGClient:
         return sorted(by_month, key=lambda item: item[WF_ATTR_MONTH])
 
     def _get_daily_data(self, account, year, month):
-        try:
-            return self.api_query_day_electric_by_m_point(
-                year, month, account.area_code, account.ele_customer_id,
-                account.metering_point_id,
+        """Fetch daily detail, tolerating CSG's withdrawn daily-charge endpoint.
+
+        The web app moved to queryElectricityCalendar, but that response only
+        carries kWh. Try a few parameter variants of the old endpoint first:
+        when CSG merely changed the metering-point identifier, the full payload
+        (charge + ladder) comes back and no estimation is needed.
+        """
+        year_month = f"{year}{month:02d}"
+        common = {
+            JSON_KEY_AREA_CODE: account.area_code,
+            JSON_KEY_ELE_CUST_ID: account.ele_customer_id,
+            JSON_KEY_YEAR_MONTH: year_month,
+        }
+        number = account.metering_point_number
+        candidates = [
+            {**common, JSON_KEY_METERING_POINT_ID: account.metering_point_id},
+            {
+                **common,
+                JSON_KEY_METERING_POINT_ID: account.metering_point_id,
+                "deviceIdentif": number or account.metering_point_id,
+            },
+        ]
+        if number and number != account.metering_point_id:
+            candidates.append({**common, JSON_KEY_METERING_POINT_ID: number})
+            candidates.append(
+                {
+                    **common,
+                    JSON_KEY_METERING_POINT_ID: number,
+                    "deviceIdentif": number,
+                }
             )
-        except CSGAPIError as error:
-            if error.sta != "02":
-                raise
+
+        def calendar_fallback():
             return self.api_query_electricity_calender(
                 year, month, account.area_code, account.ele_customer_id,
-                account.metering_point_id, account.metering_point_number,
+                account.metering_point_id, number,
             )
+
+        if getattr(self, "_daily_endpoint_dead", False):
+            return calendar_fallback()
+
+        known_good = getattr(self, "_daily_variant_index", None)
+        order = (
+            list(range(known_good, len(candidates)))
+            if known_good is not None
+            else list(range(len(candidates)))
+        )
+        for index in order:
+            try:
+                _, resp_data = self._make_request(
+                    "charge/queryDayElectricByMPoint",
+                    candidates[index],
+                    custom_headers={},
+                    encrypt_payload=self.api_profile == API_PROFILE_WEB,
+                )
+                sta = resp_data.get(JSON_KEY_STA)
+                if sta == RESP_STA_NO_LOGIN:
+                    raise NotLoggedIn(sta, resp_data.get(JSON_KEY_MESSAGE))
+                if sta == RESP_STA_SUCCESS:
+                    data = resp_data.get(JSON_KEY_DATA) or {}
+                    if data.get("result"):
+                        if getattr(self, "_daily_variant_index", None) != index:
+                            _LOGGER.info(
+                                "CSG daily detail works with payload variant %s "
+                                "(full charge/ladder data restored)", index
+                            )
+                        self._daily_variant_index = index
+                        return data
+            except NotLoggedIn:
+                raise
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.debug(
+                    "CSG daily detail variant %s failed: %s", index, err
+                )
+
+        self._daily_endpoint_dead = True
+        _LOGGER.info(
+            "CSG daily-charge endpoint unavailable (sta=02); using calendar "
+            "data plus official monthly bills to reconstruct charges"
+        )
+        return calendar_fallback()
 
     def get_yesterday_kwh(self, account: CSGElectricityAccount) -> float | None:
         """Derive yesterday's usage from the maintained monthly detail API."""
